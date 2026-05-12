@@ -1,7 +1,7 @@
-From 39369019dd98550dfa4d70eb987efcf7d13bd60f Mon Sep 17 00:00:00 2001
+From 99f8c015c5b1155bf814d2590f3c220d7e8c1a08 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Tue, 12 May 2026 18:04:11 +0900
-Subject: [PATCH] linux7.1-rc1-lru_marie-0.1.0
+Date: Wed, 13 May 2026 06:05:41 +0900
+Subject: [PATCH] linux7.1-rc1-lru_marie-0.1.1
 
 ---
  include/linux/lru_marie.h         |  355 +++++
@@ -54,7 +54,7 @@ Subject: [PATCH] linux7.1-rc1-lru_marie-0.1.0
 
 diff --git a/include/linux/lru_marie.h b/include/linux/lru_marie.h
 new file mode 100644
-index 0000000000..7796970043
+index 0000000000..3dbdcb7008
 --- /dev/null
 +++ b/include/linux/lru_marie.h
 @@ -0,0 +1,355 @@
@@ -89,7 +89,7 @@ index 0000000000..7796970043
 +#define MARIE_PROGNAME	"Marie LRU"
 +#define MARIE_AUTHOR	"Masahito Suzuki"
 +
-+#define MARIE_VERSION	"0.1.0"
++#define MARIE_VERSION	"0.1.1"
 +
 +struct folio;
 +struct lruvec;
@@ -1175,7 +1175,7 @@ index 5a2ddcf68e..8a623b677f 100644
  /*
 diff --git a/mm/lru_marie.c b/mm/lru_marie.c
 new file mode 100644
-index 0000000000..bf96588812
+index 0000000000..88d0741046
 --- /dev/null
 +++ b/mm/lru_marie.c
 @@ -0,0 +1,2406 @@
@@ -3296,13 +3296,13 @@ index 0000000000..bf96588812
 +unsigned long marie_gen_growth_threshold = (unsigned long)SWAP_CLUSTER_MAX << 8;
 +
 +/*
-+ * marie_pending_pool_lowmark — per-CPU LIFO refill trigger (0..7).
++ * marie_pending_pool_lowmark — per-CPU LIFO refill trigger (0..255).
 + * When pool->top falls below this, the refill workqueue is kicked.
-+ * Default 2: trades pool memory against alloc-miss frequency.  Raising
-+ * to MARIE_PENDING_POOL_DEPTH (8) keeps the pool eagerly full;
++ * Default 128 (= DEPTH/2): trades pool memory against alloc-miss frequency.
++ * Raising toward MARIE_PENDING_POOL_DEPTH (256) keeps the pool eagerly full;
 + * lowering to 0 disables proactive refill.
 + */
-+unsigned int marie_pending_pool_lowmark = 2;
++unsigned int marie_pending_pool_lowmark = 128;
 +
 +/*
 + * marie_walker_interval_* — adaptive walker pass deadline per pgdat,
@@ -3469,8 +3469,8 @@ index 0000000000..bf96588812
 +
 +	if (err)
 +		return err;
-+	/* Pool depth is compile-time MARIE_PENDING_POOL_DEPTH (= 8). */
-+	if (v > 8)
++	/* Pool depth is compile-time MARIE_PENDING_POOL_DEPTH (= 256). */
++	if (v > 256)
 +		return -EINVAL;
 +	WRITE_ONCE(marie_pending_pool_lowmark, v);
 +	return count;
@@ -3587,7 +3587,7 @@ index 0000000000..bf96588812
 +subsys_initcall(marie_init);
 diff --git a/mm/lru_marie_residency.c b/mm/lru_marie_residency.c
 new file mode 100644
-index 0000000000..a1bfffdc1e
+index 0000000000..efd3d899ef
 --- /dev/null
 +++ b/mm/lru_marie_residency.c
 @@ -0,0 +1,1907 @@
@@ -3671,13 +3671,13 @@ index 0000000000..a1bfffdc1e
 + * dead code.
 + *
 + * Memory cost: MARIE_PENDING_POOL_DEPTH * sizeof(marie_pending) * NR_CPUS
-+ * = 8 * 24 B * NR_CPUS = 192 B / CPU.
++ * = 256 * 16 B * NR_CPUS = 4096 B / CPU (one slab page worth per CPU).
 + *
 + * MARIE_PENDING_POOL_DEPTH stays a #define because it sizes the per-CPU
 + * stack[] array.  The low-water refill trigger is runtime-tunable as
-+ * marie_pending_pool_lowmark (sysfs default 2; range 0..8).
++ * marie_pending_pool_lowmark (sysfs default 128; range 0..256).
 + */
-+#define MARIE_PENDING_POOL_DEPTH		8
++#define MARIE_PENDING_POOL_DEPTH		256
 +
 +struct marie_pending_pool {
 +	struct marie_pending	*stack[MARIE_PENDING_POOL_DEPTH];
