@@ -1,7 +1,7 @@
-From f83241b8ddc3c8fd13ec19cd083da3885f6ccd51 Mon Sep 17 00:00:00 2001
+From 8611f8122a980adf72cd462de7e6d66bdadb09a9 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
 Date: Wed, 13 May 2026 14:36:59 +0900
-Subject: [PATCH] linux6.18.22-lru_marie-0.1.2
+Subject: [PATCH] linux6.18.22-lru_marie-0.1.2r2
 
 ---
  include/linux/lru_marie.h         |  355 +++++
@@ -24,9 +24,9 @@ Subject: [PATCH] linux6.18.22-lru_marie-0.1.2
  mm/lru_marie_simd_arm64.c         |   45 +
  mm/lru_marie_simd_generic.c       |   43 +
  mm/lru_marie_simd_x86.c           |  166 ++
- mm/lru_marie_simd_x86_avx2.S      |  213 +++
- mm/lru_marie_simd_x86_avx512.S    |  198 +++
- mm/lru_marie_simd_x86_sse2.S      |  214 +++
+ mm/lru_marie_simd_x86_avx2.S      |  214 +++
+ mm/lru_marie_simd_x86_avx512.S    |  199 +++
+ mm/lru_marie_simd_x86_sse2.S      |  215 +++
  mm/lru_marie_sort.c               |  259 ++++
  mm/lru_marie_walker.c             |  985 ++++++++++++
  mm/memcontrol.c                   |    2 +
@@ -37,7 +37,7 @@ Subject: [PATCH] linux6.18.22-lru_marie-0.1.2
  mm/swap.c                         |   29 +-
  mm/swap.h                         |    4 +
  mm/vmscan.c                       |  262 ++--
- 33 files changed, 8713 insertions(+), 139 deletions(-)
+ 33 files changed, 8716 insertions(+), 139 deletions(-)
  create mode 100644 include/linux/lru_marie.h
  create mode 100644 include/linux/lru_marie_simd.h
  create mode 100644 lib/tests/.kunitconfig
@@ -6757,10 +6757,10 @@ index 0000000000..b7a3c55e77
 +EXPORT_SYMBOL_GPL(lru_marie_simd_young_pte_mask);
 diff --git a/mm/lru_marie_simd_x86_avx2.S b/mm/lru_marie_simd_x86_avx2.S
 new file mode 100644
-index 0000000000..1b5cc84c7a
+index 0000000000..f317e38703
 --- /dev/null
 +++ b/mm/lru_marie_simd_x86_avx2.S
-@@ -0,0 +1,213 @@
+@@ -0,0 +1,214 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * mm/marie_simd_x86_avx2.S -- AVX2 PTE young-bit scan for Marie walker.
@@ -6823,6 +6823,7 @@ index 0000000000..1b5cc84c7a
 + */
 +
 +#include <linux/linkage.h>
++#include <linux/cfi_types.h>
 +
 +	/* -------------------------------------------------------------- */
 +	/* Read-only data: young-bit mask broadcast                        */
@@ -6976,10 +6977,10 @@ index 0000000000..1b5cc84c7a
 +SYM_FUNC_END(lru_marie_simd_scan_avx2)
 diff --git a/mm/lru_marie_simd_x86_avx512.S b/mm/lru_marie_simd_x86_avx512.S
 new file mode 100644
-index 0000000000..77b780c6cd
+index 0000000000..ec19ccfdbb
 --- /dev/null
 +++ b/mm/lru_marie_simd_x86_avx512.S
-@@ -0,0 +1,198 @@
+@@ -0,0 +1,199 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * mm/marie_simd_x86_avx512.S -- AVX-512F PTE young-bit scan for Marie walker.
@@ -7044,6 +7045,7 @@ index 0000000000..77b780c6cd
 + */
 +
 +#include <linux/linkage.h>
++#include <linux/cfi_types.h>
 +
 +	/* -------------------------------------------------------------- */
 +	/* Read-only data: young-bit mask broadcast                        */
@@ -7180,10 +7182,10 @@ index 0000000000..77b780c6cd
 +SYM_FUNC_END(lru_marie_simd_scan_avx512)
 diff --git a/mm/lru_marie_simd_x86_sse2.S b/mm/lru_marie_simd_x86_sse2.S
 new file mode 100644
-index 0000000000..0aa861f84d
+index 0000000000..09852b3c76
 --- /dev/null
 +++ b/mm/lru_marie_simd_x86_sse2.S
-@@ -0,0 +1,214 @@
+@@ -0,0 +1,215 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * mm/marie_simd_x86_sse2.S -- SSE2 PTE young-bit scan for the Marie walker.
@@ -7236,6 +7238,7 @@ index 0000000000..0aa861f84d
 + */
 +
 +#include <linux/linkage.h>
++#include <linux/cfi_types.h>
 +
 +	/* -------------------------------------------------------------- */
 +	/* Read-only data: young-bit mask broadcast                        */
