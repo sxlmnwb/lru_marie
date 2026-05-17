@@ -1,7 +1,7 @@
-From aa590a1dac3adfdf01b58e9fdd80263dc9c5a762 Mon Sep 17 00:00:00 2001
+From 74412e993432bed2e74a5bb24f744f02c6be27ec Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Sun, 17 May 2026 12:01:28 +0900
-Subject: [PATCH] linux6.12.74-lru_marie-0.1.5
+Date: Sun, 17 May 2026 21:10:19 +0900
+Subject: [PATCH] linux6.12.74-lru_marie-0.1.5r2
 
 ---
  include/linux/lru_marie.h         |  355 +++++
@@ -28,6 +28,7 @@ Subject: [PATCH] linux6.12.74-lru_marie-0.1.5
  mm/lru_marie_sort.c               |  259 +++
  mm/lru_marie_walker.c             | 1023 ++++++++++++
  mm/memcontrol.c                   |    2 +
+ mm/memfd.c                        |    3 +-
  mm/mm_init.c                      |    6 +-
  mm/page_alloc.c                   |   86 +
  mm/page_io.c                      |  175 ++
@@ -35,7 +36,7 @@ Subject: [PATCH] linux6.12.74-lru_marie-0.1.5
  mm/swap.c                         |   29 +-
  mm/swap.h                         |    4 +
  mm/vmscan.c                       |  262 +--
- 31 files changed, 9126 insertions(+), 133 deletions(-)
+ 32 files changed, 9127 insertions(+), 135 deletions(-)
  create mode 100644 include/linux/lru_marie.h
  create mode 100644 include/linux/lru_marie_simd.h
  create mode 100644 lib/tests/.kunitconfig
@@ -9036,6 +9037,20 @@ index dcd2d0e15e..61ccb5cd99 100644
  	memcg_wb_domain_exit(memcg);
  	__mem_cgroup_free(memcg);
  }
+diff --git a/mm/memfd.c b/mm/memfd.c
+index 119467307b..035da9ba1c 100644
+--- a/mm/memfd.c
++++ b/mm/memfd.c
+@@ -31,8 +31,7 @@
+ 
+ static bool memfd_folio_has_extra_refs(struct folio *folio)
+ {
+-	return folio_ref_count(folio) - folio_mapcount(folio) !=
+-	       folio_nr_pages(folio);
++	return folio_ref_count(folio) != folio_expected_ref_count(folio);
+ }
+ 
+ static void memfd_tag_pins(struct xa_state *xas)
 diff --git a/mm/mm_init.c b/mm/mm_init.c
 index 624c1f90ce..193e553ed8 100644
 --- a/mm/mm_init.c
