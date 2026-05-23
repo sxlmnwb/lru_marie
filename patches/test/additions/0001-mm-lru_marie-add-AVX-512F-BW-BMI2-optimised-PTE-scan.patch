@@ -1,0 +1,546 @@
+From 429e257de18f8a5c8e69a4ad7674f87f09d5c837 Mon Sep 17 00:00:00 2001
+From: Salman Wahib <sxlmnwb.dev@gmail.com>
+Date: Sat, 23 May 2026 16:24:10 +0700
+Subject: [PATCH] mm/lru_marie: add AVX-512F+BW+BMI2 optimised PTE scanner for
+ AMD Zen 5
+
+Introduce mm/lru_marie_simd_x86_avx512_zen5.S, a Zen 5-specific SIMD
+kernel for the Marie LRU PTE young-bit scanner, and wire it into the
+boot-time dispatch in mm/lru_marie_simd_x86.c.
+
+The upstream avx512f kernel targets the AVX-512F Foundation subset for
+broad compatibility (Xeon Phi, early Skylake-SP). AMD Zen 5 exposes
+AVX-512BW and BMI2 in addition to AVX-512F, enabling three further
+optimisations that are unsafe or unavailable on the generic path:
+
+1. SHLXQ (BMI2) replaces push/pop-around-shlq
+   The upstream variable shift requires the count in CL, forcing
+   push/pop of RCX (inner loop counter) on every inner iteration:
+   2 extra uops x 64 inner iterations = 128 extraneous uops per call.
+   SHLXQ shifts from any GPR without touching flags or CL, eliminating
+   the push/pop pair entirely.
+
+2. 2x inner-loop unroll (16 PTEs per iteration, up from 8)
+   Zen 5 has two AVX-512 execution ports (p0/p1). Unrolling by 2 lets
+   the two VPTESTMQ ops dual-issue in a single cycle. Loop overhead
+   (dec+jnz) is halved. Inner loop drops from 8 to 4 iterations per
+   outer pass.
+
+3. vmovdqa64 replaces vmovdqu64
+   The kernel page-table allocator guarantees 4096-byte alignment for
+   PTE tables; 4096 is a multiple of 64, so all 512-bit ZMM loads are
+   naturally aligned. vmovdqa64 avoids the alignment micro-op that
+   vmovdqu64 inserts on Zen 5 L1D.
+
+4. KMOVB (AVX-512BW) replaces KMOVW
+   VPTESTMQ on an 8-lane ZMM produces exactly 8 result bits in
+   k1[7:0]. KMOVB is semantically exact (8-bit opmask -> GPR,
+   zero-extended to 64) and avoids an implicit dependency on the
+   upper opmask bits that KMOVW carries.
+
+5. Software prefetch (PREFETCHT0 256 bytes ahead)
+   Issued at the top of each inner iteration to hide L1D fill latency
+   for the next ZMM pair. Zen 5's hardware prefetcher handles
+   sequential patterns well but benefits from the explicit hint at
+   4 KB PTE table boundaries.
+
+The new kernel is selected only when all three feature bits are
+confirmed at boot (AVX512F + AVX512BW + BMI2); the existing
+avx512f kernel remains the fallback for CPUs that lack BMI2 or
+AVX-512BW.
+
+A new read-only sysfs attribute, /sys/kernel/mm/lru_marie/simd_alg,
+is added to report the boot-selected SIMD kernel name at runtime
+("avx512f_zen5", "avx512f", "avx2", or "sse2").
+
+Verified on:
+  CPU:        AMD Ryzen AI 9 HX 370 (Zen 5, Strix Point)
+  Kernel:     linux-7.0.y
+  lru_marie:  0001-linux7.0-lru_marie-0.1.5.patch
+  dmesg:      "SIMD PTE scan: AVX-512F+BW+BMI2 Zen5 (16 PTEs/iter)"
+  sysfs:      /sys/kernel/mm/lru_marie/simd_alg = avx512f_zen5
+
+Cc: Masahito S <firelzrd@gmail.com>
+Signed-off-by: Salman Wahib <sxlmnwb.dev@gmail.com>
+---
+ include/linux/lru_marie_simd.h      |   9 +
+ mm/Makefile                         |   1 +
+ mm/lru_marie.c                      |   9 +
+ mm/lru_marie_simd_x86.c             |  28 ++-
+ mm/lru_marie_simd_x86_avx512_zen5.S | 345 ++++++++++++++++++++++++++++
+ 5 files changed, 388 insertions(+), 4 deletions(-)
+ create mode 100644 mm/lru_marie_simd_x86_avx512_zen5.S
+
+diff --git a/include/linux/lru_marie_simd.h b/include/linux/lru_marie_simd.h
+index 53d7da695a0d..83b3672f946a 100644
+--- a/include/linux/lru_marie_simd.h
++++ b/include/linux/lru_marie_simd.h
+@@ -44,6 +44,15 @@ static inline bool marie_simd_enabled(void)
+ {
+ 	return static_branch_likely(&marie_simd_enabled_key);
+ }
++
++/**
++ * lru_marie_simd_alg - return the name of the boot-selected SIMD kernel.
++ *
++ * Returns one of: "avx512f_zen5", "avx512f", "avx2", "sse2".
++ * Read-only after arch_initcall; safe to call without locks.
++ */
++const char *lru_marie_simd_alg(void);
++
+ #else
+ static inline bool marie_simd_enabled(void) { return false; }
+ #endif
+diff --git a/mm/Makefile b/mm/Makefile
+index 27cbfb2b5d5a..3ef1347e6f21 100644
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@ -84,6 +84,7 @@ obj-$(CONFIG_LRU_MARIE)	+= lru_marie_simd_x86.o
+ obj-$(CONFIG_LRU_MARIE)	+= lru_marie_simd_x86_sse2.o
+ obj-$(CONFIG_LRU_MARIE)	+= lru_marie_simd_x86_avx2.o
+ obj-$(CONFIG_LRU_MARIE)	+= lru_marie_simd_x86_avx512.o
++obj-$(CONFIG_LRU_MARIE)	+= lru_marie_simd_x86_avx512_zen5.o
+ else ifdef CONFIG_ARM64
+ obj-$(CONFIG_LRU_MARIE)	+= lru_marie_simd_arm64.o
+ else
+diff --git a/mm/lru_marie.c b/mm/lru_marie.c
+index bdcd08fd2f65..00780dc81b9e 100644
+--- a/mm/lru_marie.c
++++ b/mm/lru_marie.c
+@@ -2151,6 +2151,14 @@ static ssize_t simd_store(struct kobject *kobj,
+ }
+ 
+ static struct kobj_attribute marie_simd_attr = __ATTR_RW(simd);
++
++static ssize_t simd_alg_show(struct kobject *kobj,
++			     struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%s\n", lru_marie_simd_alg());
++}
++
++static struct kobj_attribute marie_simd_alg_attr = __ATTR_RO(simd_alg);
+ #endif /* CONFIG_X86 */
+ 
+ /*
+@@ -2420,6 +2428,7 @@ static struct attribute *marie_attrs[] = {
+ #endif
+ #ifdef CONFIG_X86
+ 	&marie_simd_attr.attr,
++	&marie_simd_alg_attr.attr,
+ #endif
+ 	&marie_zero_progress_throttle_attr.attr,
+ 	&marie_shrink_batch_threshold_attr.attr,
+diff --git a/mm/lru_marie_simd_x86.c b/mm/lru_marie_simd_x86.c
+index b7a3c55e7758..3b046746530c 100644
+--- a/mm/lru_marie_simd_x86.c
++++ b/mm/lru_marie_simd_x86.c
+@@ -53,16 +53,27 @@
+  * below for benchmark A/B comparisons.
+  */
+ DEFINE_STATIC_KEY_TRUE(marie_simd_enabled_key);
++
++static const char *marie_simd_alg_name = "sse2";
++
++const char *lru_marie_simd_alg(void)
++{
++	return marie_simd_alg_name;
++}
++
++EXPORT_SYMBOL_GPL(lru_marie_simd_alg);
+ EXPORT_SYMBOL_GPL(marie_simd_enabled_key);
+ 
+ /* Defined in mm/lru_marie_simd_x86_{sse2,avx2,avx512}.S.
+  * Caller must hold kernel_fpu_begin/end. */
+ asmlinkage void lru_marie_simd_scan_sse2(const pte_t *pte_table,
+-				   unsigned long *bitmap);
++					unsigned long *bitmap);
+ asmlinkage void lru_marie_simd_scan_avx2(const pte_t *pte_table,
+-				   unsigned long *bitmap);
++					unsigned long *bitmap);
+ asmlinkage void lru_marie_simd_scan_avx512(const pte_t *pte_table,
+-				     unsigned long *bitmap);
++					unsigned long *bitmap);
++asmlinkage void lru_marie_simd_scan_avx512_zen5(const pte_t *pte_table,
++					unsigned long *bitmap);
+ 
+ /* ------------------------------------------------------------------ */
+ /* Scalar fallback                                                    */
+@@ -112,14 +123,23 @@ static int __init marie_simd_x86_init(void)
+ 	 * via PSHUFD packing trick -- already the default before this
+ 	 * runs, so we do nothing for the SSE2 case).
+ 	 */
+-	if (boot_cpu_has(X86_FEATURE_AVX512F)) {
++	if (boot_cpu_has(X86_FEATURE_AVX512F) &&
++	    boot_cpu_has(X86_FEATURE_AVX512BW) &&
++	    boot_cpu_has(X86_FEATURE_BMI2)) {
++		static_call_update(marie_simd_scan, lru_marie_simd_scan_avx512_zen5);
++		marie_simd_alg_name = "avx512f_zen5";
++		pr_info("SIMD PTE scan: AVX-512F+BW+BMI2 Zen5 (16 PTEs/iter)\n");
++	} else if (boot_cpu_has(X86_FEATURE_AVX512F)) {
+ 		static_call_update(marie_simd_scan, lru_marie_simd_scan_avx512);
++		marie_simd_alg_name = "avx512f";
+ 		pr_info("SIMD PTE scan: AVX-512F (8 PTEs/iter)\n");
+ 	} else if (boot_cpu_has(X86_FEATURE_AVX2)) {
+ 		static_call_update(marie_simd_scan, lru_marie_simd_scan_avx2);
++		marie_simd_alg_name = "avx2";
+ 		pr_info("SIMD PTE scan: AVX2 (4 PTEs/iter)\n");
+ 	} else {
+ 		/* default already = lru_marie_simd_scan_sse2 */
++		marie_simd_alg_name = "sse2";
+ 		pr_info("SIMD PTE scan: SSE2 (4 PTEs/iter, x86-64 baseline)\n");
+ 	}
+ 	return 0;
+diff --git a/mm/lru_marie_simd_x86_avx512_zen5.S b/mm/lru_marie_simd_x86_avx512_zen5.S
+new file mode 100644
+index 000000000000..7699d43b67fc
+--- /dev/null
++++ b/mm/lru_marie_simd_x86_avx512_zen5.S
+@@ -0,0 +1,345 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * mm/lru_marie_simd_x86_avx512_zen5.S
++ *
++ * AVX-512F + BMI2 PTE young-bit scan for Marie walker.
++ * Optimised for AMD Zen 5.
++ *
++ * Processes 512 PTEs (one full PMD page table) per call, producing an
++ * 8-ulong (512-bit) young-bit bitmap.
++ *
++ * -----------------------------------------------------------------------
++ * Changes vs. the upstream lru_marie_simd_x86_avx512.S
++ * -----------------------------------------------------------------------
++ *
++ * 1. SHLXQ replaces push/pop-around-shlq  [BMI2, biggest win]
++ *    Upstream uses a CL-based variable shift which requires the shift
++ *    count in CL and therefore forces push/pop of RCX (inner counter)
++ *    on every inner iteration — 2 extra memory ops × 64 inner iters =
++ *    128 extraneous instructions per call.
++ *
++ *    BMI2 SHLXQ shifts from any GPR without touching flags or CL:
++ *      shlxq %r9, %rax, %rax   ; shift rax left by r9, result -> rax
++ *    RCX is now free throughout the inner loop; the push/pop pair is
++ *    gone entirely.  On Zen 5 this saves ~128 uops per call and frees
++ *    up a store-to-load forwarding slot per iteration.
++ *
++ * 2. vmovdqa64 replaces vmovdqu64  [aligned load]
++ *    The kernel page-table allocator guarantees 4096-byte alignment for
++ *    PTE tables.  4096 is a multiple of 64, so the 512-bit ZMM load is
++ *    always naturally aligned.  vmovdqa64 avoids the alignment-check
++ *    micro-op that vmovdqu64 inserts on misaligned addresses (Zen 5
++ *    L1D handles aligned 512-bit loads in a single cycle).
++ *
++ * 3. Software prefetch (PREFETCHT0)
++ *    Explicit prefetch 256 bytes ahead (4 ZMM loads) issued at the top
++ *    of each inner iteration.  Zen 5's hardware stream prefetcher
++ *    handles sequential patterns well, but the PTE table is 4 KB —
++ *    crossing a 256-byte boundary on every other iteration means the
++ *    hardware prefetcher may not get ahead of L1 latency on the first
++ *    few iterations.  PREFETCHT0 targets L1D (lowest latency).
++ *
++ * 4. 2× inner-loop unroll (16 PTEs per iteration)
++ *    Zen 5 can decode up to 8 instructions/cycle (wider than Zen 4's 4)
++ *    and has two AVX-512 execution pipes (port 0 and port 1).  Unrolling
++ *    by 2 lets the CPU overlap the vmovdqa64/vptestmq/kmovb pipeline of
++ *    two successive 8-PTE blocks; the loop-counter overhead is halved;
++ *    and the two VPTESTMQ ops can be dispatched to separate ports.
++ *    Inner loop is now 4 iterations (each handling 16 PTEs) instead of 8.
++ *
++ * 5. KMOVB replaces KMOVW  [AVX-512BW, semantically tighter]
++ *    VPTESTMQ on an 8-lane ZMM produces exactly 8 result bits in k1[7:0].
++ *    KMOVW (AVX-512F) zero-extends to 16 bits and then to 64, which is
++ *    functionally correct but carries an implicit dependency on the upper
++ *    opmask bits.  KMOVB (AVX-512BW, available on all Zen 5 parts) is
++ *    semantically exact: 8-bit opmask -> 8-bit GPR (zero-extended to 64).
++ *    Zen 5's scheduler can potentially retire KMOVB one cycle earlier
++ *    when the opmask write port for the upper 8 bits would otherwise
++ *    stall.
++ *
++ * -----------------------------------------------------------------------
++ * Prerequisites / compatibility
++ * -----------------------------------------------------------------------
++ *
++ *   Required CPU features  : AVX-512F, AVX-512BW, BMI2
++ *   All Zen 5 desktop/mobile CPUs expose these.
++ *   The caller (mm/lru_marie_simd_x86.c) MUST gate dispatch on
++ *   boot_cpu_has(X86_FEATURE_AVX512F) && boot_cpu_has(X86_FEATURE_AVX512BW)
++ *   && boot_cpu_has(X86_FEATURE_BMI2).
++ *
++ *   This file is NOT a drop-in replacement for the upstream file on
++ *   CPUs that lack BMI2 or AVX-512BW (e.g. Xeon Phi / KNL, early
++ *   Skylake-SP with partial AVX-512 support).  Keep the upstream file
++ *   as the generic AVX-512F fallback; this file is selected only when
++ *   all three features are confirmed at runtime.
++ *
++ * -----------------------------------------------------------------------
++ * ABI (System V AMD64, unchanged from upstream)
++ * -----------------------------------------------------------------------
++ *
++ *   rdi = const pte_t *pte_table  (512 PTEs, 4096 bytes, page-aligned)
++ *   rsi = unsigned long *bitmap   (8 ulongs = 64 bytes, caller pre-cleared)
++ *
++ * -----------------------------------------------------------------------
++ * Register map
++ * -----------------------------------------------------------------------
++ *
++ *   zmm0        young-bit mask broadcast (0x20 × 8 lanes), constant
++ *   zmm1, zmm2  scratch: hold 8 PTEs each (two unrolled blocks)
++ *   k1, k2      VPTESTMQ results for the two unrolled blocks
++ *   rdi         current PTE pointer (advances +128 bytes per inner iter)
++ *   rsi         bitmap base (constant)
++ *   rdx         outer loop counter (8 → 0)
++ *   rcx         inner loop counter (4 → 0) [freed from push/pop duty]
++ *   rax         KMOVB result A / shift scratch
++ *   r10         KMOVB result B (second unrolled block)
++ *   r8          per-ulong accumulator
++ *   r9          bit-position counter within current ulong (0,16,32,48 steps
++ *               of 16 because each unrolled iter contributes 16 bits)
++ *   r11         bitmap write pointer (walks +8 bytes each outer iter)
++ *
++ *   k0 is reserved (no-mask predicate).
++ *   k3..k7 are unused.
++ *
++ * -----------------------------------------------------------------------
++ * Caller requirements (unchanged)
++ * -----------------------------------------------------------------------
++ *
++ *   Caller MUST hold kernel_fpu_begin/end around this function.
++ *   Do NOT call directly from C without an FPU context bracket.
++ *
++ * -----------------------------------------------------------------------
++ * Performance estimate (Zen 5, single core)
++ * -----------------------------------------------------------------------
++ *
++ *   Upstream (AVX-512F only):  ~5 instrs / 8 PTE  + 2 push/pop overhead
++ *   This file  (+ BMI2 + BW) :  ~5 instrs / 16 PTE (2× unroll, no push/pop)
++ *   Expected improvement      :  ~30-40% fewer uops per 512-PTE scan
++ *   Estimated wall time       :  ~6-7 ns per PMD on Zen 5 @ 5 GHz
++ *                                (down from upstream ~10 ns)
++ */
++
++#include <linux/linkage.h>
++#include <linux/cfi_types.h>
++
++        /* ------------------------------------------------------------------ */
++        /* Read-only data: young-bit mask broadcast (identical to upstream)   */
++        /* ------------------------------------------------------------------ */
++        .section .rodata
++        .align 64
++marie_avx512_zen5_young_mask:
++        /* _PAGE_ACCESSED = bit 5 = 0x20, broadcast to 8× 64-bit lanes */
++        .quad 0x0000000000000020
++        .quad 0x0000000000000020
++        .quad 0x0000000000000020
++        .quad 0x0000000000000020
++        .quad 0x0000000000000020
++        .quad 0x0000000000000020
++        .quad 0x0000000000000020
++        .quad 0x0000000000000020
++
++        /* ------------------------------------------------------------------ */
++        /* Text                                                                */
++        /* ------------------------------------------------------------------ */
++        .text
++
++/*
++ * void lru_marie_simd_scan_avx512_zen5(const pte_t *pte_table,
++ *                                       unsigned long *bitmap)
++ *
++ * pte_table : rdi — 512 PTEs (4096 bytes), guaranteed page-aligned
++ * bitmap    : rsi — 8 ulongs (64 bytes), caller pre-cleared
++ */
++SYM_TYPED_FUNC_START(lru_marie_simd_scan_avx512_zen5)
++
++        /*
++         * Load the young-bit mask into zmm0 once.
++         * vmovdqa64: aligned 512-bit load from .rodata (64-byte aligned).
++         * zmm0 is constant for the entire call — no reload needed.
++         */
++        vmovdqa64       marie_avx512_zen5_young_mask(%rip), %zmm0
++
++        movq    %rsi, %r11              /* r11 = current bitmap write ptr   */
++        movl    $8, %edx                /* outer counter: 8 ulongs          */
++
++        /*
++         * ================================================================
++         * OUTER LOOP — one iteration produces one 64-bit ulong in bitmap.
++         *
++         * 64 PTEs are processed per outer iteration:
++         *   4 inner iterations × 16 PTEs each = 64 PTEs.
++         * ================================================================
++         */
++.Louter_avx512_zen5:
++        xorq    %r8, %r8                /* accumulator = 0                  */
++        xorq    %r9, %r9                /* bit-position counter = 0         */
++        movl    $4, %ecx                /* inner counter: 4 iters (2×unroll)*/
++
++        /*
++         * ================================================================
++         * INNER LOOP — one iteration processes 16 PTEs (two 8-PTE blocks).
++         *
++         * Each block:
++         *   vmovdqa64 loads 8 PTEs (64 bytes, aligned) into a ZMM register.
++         *   vptestmq  ANDs with zmm0 and writes an 8-bit opmask (k1 or k2).
++         *   kmovb     transfers the 8-bit opmask to a GPR (rax or r10).
++         *
++         * The two blocks' results are merged:
++         *   block A (k1 → rax) occupies bits [bit-pos+7 : bit-pos]
++         *   block B (k2 → r10) occupies bits [bit-pos+15: bit-pos+8]
++         *   r10 is shifted left by 8, then ORed with rax.
++         *   The combined 16-bit value is shifted left by r9 (0,16,32,48)
++         *   and ORed into the accumulator r8.
++         *
++         * OPT 1 — SHLXQ (BMI2):
++         *   shlxq %r9, %rax, %rax  ; shift by r9 without touching rcx/flags
++         *   Eliminates push/pop rcx present in the upstream kernel.
++         *   rcx is now used only as the inner loop decrement counter.
++         *
++         * OPT 2 — vmovdqa64 (aligned):
++         *   Page-table base is 4096-byte aligned => always 64-byte aligned.
++         *   vmovdqa64 avoids the alignment micro-op of vmovdqu64 on Zen 5.
++         *
++         * OPT 3 — PREFETCHT0:
++         *   Issued at the top of each inner iter, 256 bytes ahead of the
++         *   CURRENT rdi position (i.e. 4 ZMM loads in front).  This covers
++         *   the latency of the L1→L1 fill on the next-next ZMM pair.
++         *
++         * OPT 4 — 2× unroll:
++         *   Two VPTESTMQ ops can retire on different AVX-512 ports (p0/p1)
++         *   in the same cycle.  The loop overhead (dec+jnz) is halved vs
++         *   an 8-iteration inner loop.
++         *
++         * OPT 5 — KMOVB (AVX-512BW):
++         *   Reads exactly 8 bits from k1/k2 with correct semantics and no
++         *   dependency on the upper opmask bits.
++         * ================================================================
++         */
++.Linner_avx512_zen5:
++
++        /*
++         * --- Prefetch next ZMM pair (256 bytes = 4×64-byte loads ahead) ---
++         *
++         * 256 bytes ahead covers:
++         *   current position + 128 bytes (this iter's two ZMM loads)
++         *   + next iter's first 128 bytes
++         * On Zen 5 L1D latency is ~4 cycles; prefetching 4 loads ahead
++         * hides that latency for subsequent iterations.
++         *
++         * PREFETCHT0 targets L1D (hint T0 = all cache levels including L1).
++         * If the data is already in L1 (e.g. hardware prefetcher got there
++         * first) the instruction is a no-op with no penalty.
++         */
++        prefetcht0      256(%rdi)
++
++        /*
++         * --- Block A: PTEs [ 0.. 7] of this 16-PTE pair ---
++         *
++         * vmovdqa64: aligned 512-bit load (rdi is 64-byte aligned because
++         * the outer PTE table is 4096-byte aligned and rdi advances by 128
++         * bytes per iter, preserving 64-byte alignment throughout).
++         */
++        vmovdqa64       0(%rdi), %zmm1          /* zmm1 = pte[7]..pte[0]    */
++
++        /*
++         * --- Block B: PTEs [ 8..15] of this 16-PTE pair ---
++         *
++         * Issued immediately after block A's load so the CPU can dispatch
++         * both to the load unit while the VPTESTMQ for block A executes.
++         */
++        vmovdqa64       64(%rdi), %zmm2         /* zmm2 = pte[15]..pte[8]   */
++        addq    $128, %rdi                      /* advance pointer past both */
++
++        /*
++         * VPTESTMQ for block A:
++         *   k1[i] = (zmm1[i] & zmm0[i]) != 0   for i in [0..7]
++         *   zmm0 = 0x20 in all lanes => k1[i] = 1 iff pte[i] has young bit
++         *
++         * Can retire on either Zen 5 AVX-512 port (p0 or p1).
++         */
++        vptestmq        %zmm1, %zmm0, %k1
++
++        /*
++         * VPTESTMQ for block B — can retire on the OTHER port in the same
++         * cycle as block A's VPTESTMQ (dual-issue on Zen 5).
++         */
++        vptestmq        %zmm2, %zmm0, %k2
++
++        /*
++         * OPT 5 — KMOVB (AVX-512BW):
++         * Transfer 8-bit opmask results to GPRs.
++         * Zero-extends to 64 bits; upper 56 bits of rax / r10 are 0.
++         */
++        kmovb   %k1, %eax               /* eax[7:0] = block A young bitmap  */
++        kmovb   %k2, %r10d              /* r10d[7:0] = block B young bitmap  */
++
++        /*
++         * Merge the two 8-bit results into a 16-bit value in rax:
++         *   r10 = block B result
++         *   r10 <<= 8  (B occupies bits [15:8] of the combined word)
++         *   rax |= r10 (A in bits [7:0], B in bits [15:8])
++         *
++         * OPT 1 — SHLXQ: shift r10 by 8 without CL / without flags side
++         * effects.  The immediate "8" is encoded via a temporary in r9
++         * momentarily set to 8 — but since r9 starts at 0 and advances by
++         * 16 per outer-pass, we use a dedicated small constant approach:
++         *
++         * Actually, the block-B shift by 8 is FIXED (always 8), so we can
++         * use SHLXQ with a pre-loaded constant OR a simple two-op sequence
++         * that avoids push/pop.  We use a dedicated scratch register r10
++         * and SHLXQ from a temporary that holds the constant 8.
++         *
++         * We borrow rcx momentarily: at this point in the iteration rcx
++         * holds the inner loop counter (4 → 1) which is not 8.  Instead
++         * we load the constant 8 into a scratch: use r10 for the shift
++         * count itself isn't possible (r10 IS the data); use rax shift
++         * trick:
++         *
++         *   salq $8, %r10    ; immediate shift by 8 — no CL needed at all!
++         *                    ; x86 encodes shl/sal with an 8-bit immediate
++         *                    ; directly, no variable-shift register required.
++         *
++         * This is even simpler than SHLXQ for the constant-8 case.
++         */
++        salq    $8, %r10                /* r10 = block B bits at [15:8]     */
++        orq     %r10, %rax             /* rax[15:0] = merged 16-bit result  */
++
++        /*
++         * Place the 16-bit result at the correct position in the ulong
++         * accumulator r8 using SHLXQ (BMI2).
++         *
++         * r9 = 0 for the first inner iter (bits [15:0] of the ulong)
++         *      16 for the second           (bits [31:16])
++         *      32 for the third            (bits [47:32])
++         *      48 for the fourth           (bits [63:48])
++         *
++         * OPT 1 — SHLXQ eliminates the push %rcx / mov / shlq %cl / pop
++         * sequence from upstream.  rcx remains untouched; r9 is the shift
++         * source; rax is both source and destination.
++         */
++        shlxq   %r9, %rax, %rax        /* rax <<= r9 (0, 16, 32, or 48)    */
++        orq     %rax, %r8              /* accumulate into ulong             */
++        addq    $16, %r9               /* advance bit-position by 16        */
++
++        decl    %ecx
++        jnz     .Linner_avx512_zen5
++
++        /* Store completed 64-bit ulong into bitmap. */
++        movq    %r8, (%r11)
++        addq    $8, %r11               /* advance bitmap write pointer      */
++
++        decl    %edx
++        jnz     .Louter_avx512_zen5
++
++        /*
++         * VZEROUPPER: mandatory before RET after any AVX-512 code.
++         * Clears the upper halves of all YMM/ZMM registers to avoid
++         * SSE/AVX transition penalties in subsequently executed SSE code.
++         *
++         * On Zen 5 VZEROUPPER is a single-uop instruction that completes
++         * in 1 cycle and does not flush the pipeline.
++         */
++        vzeroupper
++        RET
++
++SYM_FUNC_END(lru_marie_simd_scan_avx512_zen5)
+-- 
+2.54.0
+
